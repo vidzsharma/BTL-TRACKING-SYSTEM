@@ -12,10 +12,7 @@ class Config:
     JWT_HEADER_NAME = 'Authorization'
     JWT_HEADER_TYPE = 'Bearer'
     
-    # File Upload Configuration
-    UPLOAD_FOLDER = 'uploads'
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max file size
-    ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
+
     
     # Application Configuration
     SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')

@@ -23,12 +23,13 @@ def show_login_page():
             
             if submit_button:
                 if username and password:
-                    success, message = login_user(username, password)
-                    if success:
-                        display_success_message(message)
-                        st.rerun()
-                    else:
-                        display_error_message(message)
+                    with st.spinner("Logging in..."):
+                        success, message = login_user(username, password)
+                        if success:
+                            display_success_message(message)
+                            st.rerun()
+                        else:
+                            display_error_message(message)
                 else:
                     display_error_message("Please enter both username and password")
         

@@ -16,14 +16,14 @@ def get_auth_headers():
         return {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     return {'Content-Type': 'application/json'}
 
-def api_request(method, endpoint, data=None, files=None):
+def api_request(method, endpoint, data=None, files=None, params=None):
     """Make API request with error handling"""
     try:
         url = f"{API_BASE_URL}{endpoint}"
         headers = get_auth_headers()
         
         if method.upper() == 'GET':
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, params=params)
         elif method.upper() == 'POST':
             if files:
                 # Remove Content-Type for file uploads
@@ -89,18 +89,7 @@ def get_users():
         return response.get('users', [])
     return []
 
-def upload_mis_file(file):
-    """Upload MIS file"""
-    files = {'file': file}
-    success, response = api_request('POST', '/upload-mis', files=files)
-    return success, response
 
-def get_mis_files():
-    """Get uploaded MIS files"""
-    success, response = api_request('GET', '/mis-files')
-    if success:
-        return response.get('files', [])
-    return []
 
 def create_user(user_data):
     """Create new user (Admin only)"""
@@ -108,17 +97,16 @@ def create_user(user_data):
     return success, response
 
 # Dashboard Helper Functions
-def get_dashboard_stats():
-    """Get dashboard statistics"""
-    # This would be implemented based on your specific requirements
-    # For now, returning mock data
-    return {
-        'total_leads': 150,
-        'active_leads': 45,
-        'converted_leads': 23,
-        'conversion_rate': 15.3,
-        'team_performance': 85.7
-    }
+def get_dashboard_stats(team_member=None):
+    """Get dashboard statistics with optional team member filtering"""
+    params = {}
+    if team_member and team_member != 'All Team Members':
+        params['team_member'] = team_member
+    
+    success, response = api_request('GET', '/progress/statistics', params=params)
+    if success:
+        return response
+    return {}
 
 def create_performance_chart(data):
     """Create performance chart"""
@@ -193,21 +181,7 @@ def get_role_display_name(role):
     }
     return role_names.get(role, role.title())
 
-def validate_file_upload(file):
-    """Validate uploaded file"""
-    if file is None:
-        return False, "Please select a file"
-    
-    allowed_extensions = {'.xlsx', '.xls'}
-    file_extension = file.name.lower()
-    
-    if not any(file_extension.endswith(ext) for ext in allowed_extensions):
-        return False, "Please upload an Excel file (.xlsx or .xls)"
-    
-    if file.size > 16 * 1024 * 1024:  # 16MB limit
-        return False, "File size must be less than 16MB"
-    
-    return True, "File is valid"
+
 
 def display_success_message(message):
     """Display success message"""
@@ -223,44 +197,68 @@ def display_info_message(message):
 
 # Data Retrieval Functions
 def get_mis_data():
-    """Get MIS data"""
-    success, response = api_request('GET', '/mis-files')
+    """Get MIS data based on user role"""
+    success, response = api_request('GET', '/mis-data')
     if success:
-        return response.get('files', [])
+        return response.get('data', [])
     return []
 
-def get_leads_data(status_filter=None):
-    """Get leads data"""
-    # For now, return empty list - implement when leads API is ready
+def get_leads_data(status_filter=None, team_member=None):
+    """Get leads data with optional filtering"""
+    params = {}
+    if status_filter:
+        params['status'] = status_filter
+    if team_member and team_member != 'All Team Members':
+        params['team_member'] = team_member
+    
+    success, response = api_request('GET', '/leads', params=params)
+    if success:
+        return response.get('leads', [])
     return []
 
-def get_performance_data(days=30):
-    """Get performance data"""
-    # For now, return empty list - implement when performance API is ready
+def get_performance_data(days=30, team_member=None):
+    """Get performance data with optional team member filtering"""
+    params = {'days': days}
+    if team_member and team_member != 'All Team Members':
+        params['team_member'] = team_member
+    
+    success, response = api_request('GET', '/team/members', params=params)
+    if success:
+        return response.get('team_members', [])
     return []
 
 def get_team_members():
-    """Get team members"""
-    success, response = api_request('GET', '/users')
+    """Get team members (Admin/Team Leader only)"""
+    success, response = api_request('GET', '/team/members')
     if success:
-        return response.get('users', [])
+        return response.get('team_members', [])
     return []
 
 # User Management Functions
 def get_user_role():
     """Get current user role"""
-    user = st.session_state.get('user', {})
-    return user.get('role', 'user')
+    user = st.session_state.get('user')
+    if user:
+        return user.get('role', 'user')
+    return 'user'
+
+def get_current_user():
+    """Get current user information"""
+    return st.session_state.get('user', {})
 
 def get_user_id():
     """Get current user ID"""
-    user = st.session_state.get('user', {})
-    return user.get('id')
+    user = st.session_state.get('user')
+    if user:
+        return user.get('id')
+    return None
 
 def get_team_leader_id():
     """Get current user's team leader ID"""
-    user = st.session_state.get('user', {})
-    return user.get('team_leader_id')
+    user = st.session_state.get('user')
+    if user:
+        return user.get('team_leader_id')
+    return None
 
 def format_datetime(dt_string):
     """Format datetime string for display"""
@@ -322,13 +320,14 @@ def check_permissions(required_role):
 # Session Management
 def check_authentication():
     """Check if user is authenticated"""
-    if not st.session_state.get('logged_in'):
-        st.error("Please login to access this page")
-        st.stop()
+    return st.session_state.get('logged_in', False)
 
 def require_role(required_role):
     """Require specific role to access page"""
-    check_authentication()
+    if not check_authentication():
+        st.error("Please login to access this page")
+        st.stop()
+
     user_role = st.session_state.get('user', {}).get('role')
     
     if user_role != required_role:
@@ -337,10 +336,73 @@ def require_role(required_role):
 
 def require_roles(allowed_roles):
     """Require one of the specified roles to access page"""
-    check_authentication()
+    if not check_authentication():
+        st.error("Please login to access this page")
+        st.stop()
+    
     user_role = st.session_state.get('user', {}).get('role')
     
     if user_role not in allowed_roles:
         role_names = [get_role_display_name(role) for role in allowed_roles]
         st.error(f"Access denied. One of these roles required: {', '.join(role_names)}")
         st.stop() 
+
+# Analytics Functions
+def get_mis_analytics():
+    """Get comprehensive MIS analytics"""
+    user_id = get_user_id()
+    user_role = get_user_role()
+    team_leader_id = get_team_leader_id()
+    
+    success, response = api_request('GET', '/progress/mis-analytics', params={
+        'user_id': user_id,
+        'role': user_role,
+        'team_leader_id': team_leader_id
+    })
+    
+    if success:
+        return response.get('data', {})
+    return {}
+
+def get_login_stats():
+    """Get user login statistics including location and time (Team Leaders and Admins only)"""
+    user_id = get_user_id()
+    user_role = get_user_role()
+    team_leader_id = get_team_leader_id()
+    
+    # Only team leaders and admins can see login statistics
+    if user_role not in ['admin', 'team_leader']:
+        return []
+    
+    success, response = api_request('GET', '/progress/login-stats', params={
+        'user_id': user_id,
+        'role': user_role,
+        'team_leader_id': team_leader_id
+    })
+    
+    if success:
+        return response.get('data', [])
+    return []
+
+def get_lead_analytics():
+    """Get lead analytics grouped by application status"""
+    user_id = get_user_id()
+    user_role = get_user_role()
+    team_leader_id = get_team_leader_id()
+    
+    success, response = api_request('GET', '/progress/lead-analytics', params={
+        'user_id': user_id,
+        'role': user_role,
+        'team_leader_id': team_leader_id
+    })
+    
+    if success:
+        return response.get('data', [])
+    return []
+
+def get_team_detailed_stats():
+    """Get detailed team member statistics (Team Leaders only)"""
+    success, response = api_request('GET', '/team/detailed-stats')
+    if success:
+        return response.get('data', [])
+    return [] 

@@ -1,10 +1,10 @@
 import bcrypt
 import jwt
 from datetime import datetime, timedelta
-from flask import request, jsonify
+from flask import request, jsonify, g
 from functools import wraps
 import json
-from backend.db import get_db_cursor, close_db_connection
+from backend.db import get_db_connection
 from config import Config
 
 def hash_password(password):
@@ -46,84 +46,16 @@ def get_user_location():
         "location_name": "Delhi, India"
     }
 
-def track_login(user_id, request_data):
-    """Track user login with location and time"""
-    conn, cursor = get_db_cursor()
-    if not conn or not cursor:
-        return None
-    
-    try:
-        # Get location data
-        location_data = get_user_location()
-        
-        # Get IP address
-        ip_address = request_data.headers.get('X-Forwarded-For', 
-                    request_data.headers.get('X-Real-IP', 
-                    request_data.remote_addr))
-        
-        # Get user agent
-        user_agent = request_data.headers.get('User-Agent', '')
-        
-        # Insert login tracking record
-        cursor.execute("""
-            INSERT INTO login_tracking 
-            (user_id, ip_address, user_agent, location_data, latitude, longitude)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING tracking_id
-        """, (
-            user_id, 
-            ip_address, 
-            user_agent, 
-            json.dumps(location_data),
-            location_data['latitude'],
-            location_data['longitude']
-        ))
-        
-        tracking_id = cursor.fetchone()['tracking_id']
-        conn.commit()
-        return tracking_id
-        
-    except Exception as e:
-        print(f"Error tracking login: {e}")
-        conn.rollback()
-        return None
-    finally:
-        close_db_connection(conn, cursor)
-
-def track_logout(user_id):
-    """Track user logout time"""
-    conn, cursor = get_db_cursor()
-    if not conn or not cursor:
-        return False
-    
-    try:
-        cursor.execute("""
-            UPDATE login_tracking 
-            SET logout_time = CURRENT_TIMESTAMP
-            WHERE user_id = %s AND logout_time IS NULL
-        """, (user_id,))
-        
-        conn.commit()
-        return True
-        
-    except Exception as e:
-        print(f"Error tracking logout: {e}")
-        conn.rollback()
-        return False
-    finally:
-        close_db_connection(conn, cursor)
-
 def authenticate_user(username, password):
     """Authenticate user credentials"""
-    conn, cursor = get_db_cursor()
-    if not conn or not cursor:
-        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
     try:
         cursor.execute("""
-            SELECT user_id, username, password_hash, email, role, team_leader_id
+            SELECT id, username, password_hash, email, role, team_leader_id
             FROM users 
-            WHERE username = %s AND is_active = TRUE
+            WHERE username = ? AND is_active = 1
         """, (username,))
         
         user = cursor.fetchone()
@@ -135,7 +67,7 @@ def authenticate_user(username, password):
         print(f"Error authenticating user: {e}")
         return None
     finally:
-        close_db_connection(conn, cursor)
+        conn.close()
 
 def login_user(username, password, request_data):
     """Complete login process with tracking"""
@@ -143,26 +75,22 @@ def login_user(username, password, request_data):
     if not user:
         return None, "Invalid credentials"
     
-    # Track login
-    tracking_id = track_login(user['user_id'], request_data)
-    
     # Create token
-    token = create_token(user['user_id'], user['username'], user['role'])
+    token = create_token(user['id'], user['username'], user['role'])
     
     return {
         "token": token,
         "user": {
-            "user_id": user['user_id'],
+            "id": user['id'],
             "username": user['username'],
             "email": user['email'],
             "role": user['role'],
             "team_leader_id": user['team_leader_id']
-        },
-        "tracking_id": tracking_id
+        }
     }, "Login successful"
 
 def require_auth(f):
-    """Decorator to require authentication"""
+    """Decorator to require authentication and set current user context"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         token = None
@@ -180,8 +108,30 @@ def require_auth(f):
         if not payload:
             return jsonify({"message": "Invalid or expired token"}), 401
         
-        # Add user info to request
-        request.current_user = payload
+        # Get user details from database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, username, email, role, team_leader_id, is_active
+            FROM users 
+            WHERE id = ? AND is_active = 1
+        """, (payload['user_id'],))
+        
+        user = cursor.fetchone()
+        conn.close()
+        
+        if not user:
+            return jsonify({"message": "User not found or inactive"}), 401
+        
+        # Set current user in Flask's g object
+        g.current_user = {
+            'id': user['id'],
+            'username': user['username'],
+            'email': user['email'],
+            'role': user['role'],
+            'team_leader_id': user['team_leader_id']
+        }
+        
         return f(*args, **kwargs)
     
     return decorated_function
@@ -191,10 +141,10 @@ def require_role(required_role):
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            if not hasattr(request, 'current_user'):
+            if not hasattr(g, 'current_user'):
                 return jsonify({"message": "Authentication required"}), 401
             
-            user_role = request.current_user.get('role')
+            user_role = g.current_user.get('role')
             if user_role != required_role and user_role != 'admin':
                 return jsonify({"message": "Insufficient permissions"}), 403
             
@@ -202,17 +152,30 @@ def require_role(required_role):
         return decorated_function
     return decorator
 
+def require_admin_or_team_leader(f):
+    """Decorator to require admin or team leader role"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not hasattr(g, 'current_user'):
+            return jsonify({"message": "Authentication required"}), 401
+        
+        user_role = g.current_user.get('role')
+        if user_role not in ['admin', 'team_leader']:
+            return jsonify({"message": "Insufficient permissions"}), 403
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
 def get_user_by_id(user_id):
     """Get user by ID"""
-    conn, cursor = get_db_cursor()
-    if not conn or not cursor:
-        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
     try:
         cursor.execute("""
-            SELECT user_id, username, email, role, team_leader_id, is_active
+            SELECT id, username, email, role, team_leader_id, is_active
             FROM users 
-            WHERE user_id = %s
+            WHERE id = ?
         """, (user_id,))
         
         return cursor.fetchone()
@@ -221,19 +184,18 @@ def get_user_by_id(user_id):
         print(f"Error getting user: {e}")
         return None
     finally:
-        close_db_connection(conn, cursor)
+        conn.close()
 
 def get_team_members(team_leader_id):
     """Get all team members for a team leader"""
-    conn, cursor = get_db_cursor()
-    if not conn or not cursor:
-        return []
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
     try:
         cursor.execute("""
-            SELECT user_id, username, email, role, created_at
+            SELECT id, username, email, role, created_at
             FROM users 
-            WHERE team_leader_id = %s AND is_active = TRUE
+            WHERE team_leader_id = ? AND is_active = 1
         """, (team_leader_id,))
         
         return cursor.fetchall()
@@ -242,4 +204,25 @@ def get_team_members(team_leader_id):
         print(f"Error getting team members: {e}")
         return []
     finally:
-        close_db_connection(conn, cursor) 
+        conn.close()
+
+def get_team_leader_id(user_id):
+    """Get team leader ID for a user"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            SELECT team_leader_id
+            FROM users 
+            WHERE id = ?
+        """, (user_id,))
+        
+        result = cursor.fetchone()
+        return result['team_leader_id'] if result else None
+        
+    except Exception as e:
+        print(f"Error getting team leader: {e}")
+        return None
+    finally:
+        conn.close() 

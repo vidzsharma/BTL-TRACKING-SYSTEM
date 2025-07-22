@@ -1,6 +1,6 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Blueprint, request, jsonify, g
+from werkzeug.security import generate_password_hash
+from backend.auth import check_password
 import pandas as pd
 import os
 from datetime import datetime, date
@@ -10,6 +10,9 @@ from backend.db import (
     get_user_by_username, get_user_by_id, create_user, 
     update_user_login, log_login, get_team_members, get_all_users, get_db_connection
 )
+from backend.auth import require_auth, require_role, require_admin_or_team_leader
+from backend.mis import get_mis_data, get_mis_statistics
+from backend.progress import create_lead, get_user_leads, update_lead_progress
 
 # Create Blueprint
 app = Blueprint('api', __name__, url_prefix='/api')
@@ -26,25 +29,32 @@ def login():
             return jsonify({'error': 'Username and password are required'}), 400
         
         user = get_user_by_username(username)
-        if not user or not check_password_hash(user['password_hash'], password):
+        if not user or not check_password(user['password_hash'], password):
             return jsonify({'error': 'Invalid credentials'}), 401
         
-        # Get location data
+        # Get location data (optional - don't fail if this doesn't work)
         location = "Unknown"
         try:
-            response = requests.get(Config.LOCATION_API_URL)
+            response = requests.get(Config.LOCATION_API_URL, timeout=2)
             if response.status_code == 200:
                 location_data = response.json()
                 location = f"{location_data.get('city', 'Unknown')}, {location_data.get('country', 'Unknown')}"
-        except:
-            pass
+        except Exception as e:
+            # Log the error but don't fail the login
+            print(f"Location API error (non-critical): {e}")
+            location = "Unknown"
         
         # Update login info
-        update_user_login(user['id'], location)
-        log_login(user['id'], request.remote_addr, location, request.headers.get('User-Agent', ''))
+        try:
+            update_user_login(user['id'], location)
+            log_login(user['id'], request.remote_addr, location, request.headers.get('User-Agent', ''))
+        except Exception as e:
+            # Log the error but don't fail the login
+            print(f"Login tracking error (non-critical): {e}")
         
-        # Create access token
-        access_token = create_access_token(identity=str(user['id']))
+        # Create JWT token
+        from backend.auth import create_token
+        access_token = create_token(user['id'], user['username'], user['role'])
         
         return jsonify({
             'access_token': access_token,
@@ -58,19 +68,15 @@ def login():
         }), 200
         
     except Exception as e:
+        print(f"Login error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/register', methods=['POST'])
-@jwt_required()
+@require_auth
+@require_role('admin')
 def register():
     """Register new user (Admin only)"""
     try:
-        current_user_id = get_jwt_identity()
-        current_user = get_user_by_id(int(current_user_id))
-        
-        if current_user['role'] != 'admin':
-            return jsonify({'error': 'Only admins can register new users'}), 403
-        
         data = request.get_json()
         username = data.get('username')
         password = data.get('password')
@@ -93,17 +99,16 @@ def register():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/users', methods=['GET'])
-@jwt_required()
+@require_auth
 def get_users():
-    """Get all users (Admin/Team Leader only)"""
+    """Get users based on role hierarchy"""
     try:
-        current_user_id = get_jwt_identity()
-        current_user = get_user_by_id(int(current_user_id))
+        current_user = g.current_user
         
         if current_user['role'] == 'admin':
             users = get_all_users()
         elif current_user['role'] == 'team_leader':
-            users = get_team_members(int(current_user_id))
+            users = get_team_members(current_user['id'])
         else:
             return jsonify({'error': 'Access denied'}), 403
         
@@ -126,121 +131,42 @@ def get_users():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/profile', methods=['GET'])
-@jwt_required()
+@require_auth
 def get_profile():
     """Get current user profile"""
     try:
-        current_user_id = get_jwt_identity()
-        user = get_user_by_id(int(current_user_id))
-        
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
+        current_user = g.current_user
         
         return jsonify({
-            'id': user['id'],
-            'username': user['username'],
-            'email': user['email'],
-            'role': user['role'],
-            'team_leader_id': user['team_leader_id'],
-            'created_at': user['created_at'],
-            'last_login': user['last_login']
+            'id': current_user['id'],
+            'username': current_user['username'],
+            'email': current_user['email'],
+            'role': current_user['role'],
+            'team_leader_id': current_user['team_leader_id']
         }), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/upload-mis', methods=['POST'])
-@jwt_required()
-def upload_mis():
-    """Upload MIS file"""
-    try:
-        current_user_id = int(get_jwt_identity())
-        
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-        
-        if not file.filename.lower().endswith(('.xlsx', '.xls')):
-            return jsonify({'error': 'Only Excel files are allowed'}), 400
-        
-        # Create uploads directory if it doesn't exist
-        os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
-        
-        # Save file
-        filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
-        file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
-        file.save(file_path)
-        
-        # Process file
-        try:
-            df = pd.read_excel(file_path)
-            total_records = len(df)
-            
-            # Here you would process the MIS data according to your requirements
-            # For now, we'll just save the file info
-            
-            # Save to database
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO mis_data (file_name, uploaded_by, total_records, processed_records, file_path)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (filename, current_user_id, total_records, total_records, file_path))
-            conn.commit()
-            conn.close()
-            
-            return jsonify({
-                'message': 'File uploaded successfully',
-                'filename': filename,
-                'total_records': total_records
-            }), 200
-            
-        except Exception as e:
-            return jsonify({'error': f'Error processing file: {str(e)}'}), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/mis-files', methods=['GET'])
-@jwt_required()
+@require_auth
 def get_mis_files():
-    """Get uploaded MIS files"""
+    """Get uploaded MIS files based on role hierarchy"""
     try:
-        current_user_id = get_jwt_identity()
-        current_user = get_user_by_id(int(current_user_id))
+        current_user = g.current_user
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if current_user['role'] == 'admin':
-            cursor.execute('''
-                SELECT m.*, u.username as uploaded_by_name
-                FROM mis_data m
-                JOIN users u ON m.uploaded_by = u.id
-                ORDER BY m.upload_date DESC
-            ''')
-        else:
-            cursor.execute('''
-                SELECT m.*, u.username as uploaded_by_name
-                FROM mis_data m
-                JOIN users u ON m.uploaded_by = u.id
-                WHERE m.uploaded_by = ?
-                ORDER BY m.upload_date DESC
-            ''', (current_user_id,))
-        
-        files = cursor.fetchall()
-        conn.close()
+        # Get MIS data based on role
+        mis_data = get_mis_data(current_user['id'], current_user['role'], current_user['team_leader_id'])
         
         file_list = []
-        for file in files:
+        for file in mis_data:
             file_list.append({
                 'id': file['id'],
                 'file_name': file['file_name'],
                 'upload_date': file['upload_date'],
-                'uploaded_by': file['uploaded_by_name'],
+                'created_by': file['created_by'],
                 'total_records': file['total_records'],
                 'processed_records': file['processed_records'],
                 'status': file['status']
@@ -249,4 +175,255 @@ def get_mis_files():
         return jsonify({'files': file_list}), 200
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500 
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/mis-data', methods=['GET'])
+@require_auth
+def get_mis_data_route():
+    """Get actual MIS data records based on role hierarchy"""
+    try:
+        current_user = g.current_user
+        
+        # Get MIS data based on role
+        mis_data = get_mis_data(current_user['id'], current_user['role'], current_user['team_leader_id'])
+        
+        # Convert SQLite Row objects to dictionaries for JSON serialization
+        mis_data_dict = []
+        for row in mis_data:
+            mis_data_dict.append(dict(row))
+        
+        return jsonify({'data': mis_data_dict}), 200
+        
+    except Exception as e:
+        print(f"Error in get_mis_data_route: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/leads', methods=['GET'])
+@require_auth
+def get_leads():
+    """Get leads based on role hierarchy"""
+    try:
+        current_user = g.current_user
+        status_filter = request.args.get('status')
+        team_member = request.args.get('team_member')  # For team leaders to filter by member
+        
+        # Get leads based on role
+        leads = get_user_leads(
+            current_user['id'], 
+            current_user['role'], 
+            current_user['team_leader_id'],
+            status_filter,
+            team_member
+        )
+        
+        return jsonify({'leads': leads}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/leads', methods=['POST'])
+@require_auth
+def create_new_lead():
+    """Create a new lead"""
+    try:
+        current_user = g.current_user
+        data = request.get_json()
+        
+        # Extract lead data
+        customer_name = data.get('customer_name')
+        customer_phone = data.get('customer_phone')
+        customer_email = data.get('customer_email')
+        bank_name = data.get('bank_name')
+        campaign_tag = data.get('campaign_tag')
+        
+        if not customer_name:
+            return jsonify({'error': 'Customer name is required'}), 400
+        
+        # Create lead with created_by field
+        success, result = create_lead(
+            current_user['id'],
+            campaign_tag,
+            customer_name,
+            customer_phone,
+            customer_email,
+            bank_name,
+            current_user['username']  # created_by field
+        )
+        
+        if success:
+            return jsonify(result), 201
+        else:
+            return jsonify({'error': result}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/leads/<int:lead_id>/progress', methods=['PUT'])
+@require_auth
+def update_lead_progress_route(lead_id):
+    """Update lead progress"""
+    try:
+        current_user = g.current_user
+        data = request.get_json()
+        
+        progress_status = data.get('status')
+        progress_notes = data.get('notes')
+        
+        if not progress_status:
+            return jsonify({'error': 'Status is required'}), 400
+        
+        # Update lead progress
+        success, result = update_lead_progress(
+            lead_id,
+            current_user['id'],
+            progress_status,
+            progress_notes
+        )
+        
+        if success:
+            return jsonify({'message': result}), 200
+        else:
+            return jsonify({'error': result}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/progress/statistics', methods=['GET'])
+@require_auth
+def get_progress_statistics():
+    """Get progress statistics based on role hierarchy"""
+    try:
+        current_user = g.current_user
+        days = request.args.get('days', 30, type=int)
+        
+        from backend.progress import get_progress_statistics as get_stats
+        stats = get_stats(
+            current_user['id'],
+            current_user['role'],
+            current_user['team_leader_id'],
+            days
+        )
+        
+        return jsonify(stats), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/progress/mis-analytics', methods=['GET'])
+@require_auth
+def get_mis_analytics():
+    """Get comprehensive MIS analytics"""
+    try:
+        current_user = g.current_user
+        days = request.args.get('days', 30, type=int)
+        
+        from backend.progress import get_mis_analytics
+        analytics = get_mis_analytics(
+            current_user['id'],
+            current_user['role'],
+            current_user['team_leader_id'],
+            days
+        )
+        
+        return jsonify({'success': True, 'data': analytics}), 200
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/progress/login-stats', methods=['GET'])
+@require_auth
+def get_login_stats():
+    """Get user login statistics including location and time"""
+    try:
+        current_user = g.current_user
+        days = request.args.get('days', 30, type=int)
+        
+        from backend.progress import get_user_login_stats
+        login_stats = get_user_login_stats(
+            current_user['id'],
+            current_user['role'],
+            current_user['team_leader_id'],
+            days
+        )
+        
+        return jsonify({'success': True, 'data': login_stats}), 200
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/progress/lead-analytics', methods=['GET'])
+@require_auth
+def get_lead_analytics():
+    """Get lead analytics grouped by application status"""
+    try:
+        current_user = g.current_user
+        days = request.args.get('days', 30, type=int)
+        
+        from backend.progress import get_lead_analytics_by_status
+        lead_analytics = get_lead_analytics_by_status(
+            current_user['id'],
+            current_user['role'],
+            current_user['team_leader_id'],
+            days
+        )
+        
+        return jsonify({'success': True, 'data': lead_analytics}), 200
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/team/members', methods=['GET'])
+@require_auth
+def get_team_members_route():
+    """Get team members (Admin and Team Leaders only)"""
+    try:
+        current_user = g.current_user
+        
+        if current_user['role'] not in ['admin', 'team_leader']:
+            return jsonify({'error': 'Access denied'}), 403
+        
+        if current_user['role'] == 'admin':
+            # Admin can see all users
+            users = get_all_users()
+        else:
+            # Team leader can see their team members
+            users = get_team_members(current_user['id'])
+        
+        user_list = []
+        for user in users:
+            user_list.append({
+                'id': user['id'],
+                'username': user['username'],
+                'email': user['email'],
+                'role': user['role'],
+                'created_at': user['created_at'],
+                'is_active': user['is_active']
+            })
+        
+        return jsonify({'team_members': user_list}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/team/detailed-stats', methods=['GET'])
+@require_auth
+def get_team_detailed_stats():
+    """Get detailed statistics for team members (Team Leaders only)"""
+    try:
+        current_user = g.current_user
+        
+        if current_user['role'] != 'team_leader':
+            return jsonify({'error': 'Access denied. Team Leaders only.'}), 403
+        
+        days = request.args.get('days', 30, type=int)
+        
+        from backend.progress import get_team_member_detailed_stats
+        detailed_stats = get_team_member_detailed_stats(
+            current_user['id'],
+            days
+        )
+        
+        return jsonify({'success': True, 'data': detailed_stats}), 200
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500 
